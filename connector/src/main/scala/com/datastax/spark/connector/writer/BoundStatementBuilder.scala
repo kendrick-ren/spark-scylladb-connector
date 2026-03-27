@@ -38,17 +38,38 @@ private[connector] class BoundStatementBuilder[T](
     val protocolVersion: ProtocolVersion) extends Logging {
 
   private val columnNames = rowWriter.columnNames.toIndexedSeq
-  private val columnTypes = columnNames.map(preparedStmt.getVariableDefinitions.get(_).getType)
-  private val converters = columnTypes.map(ColumnType.converterToCassandra(_))
+
+  /** Per-column flag: true when the column is present in the prepared statement.
+    * Uses ColumnDefinitions.contains() which does CQL-aware case matching
+    * (unquoted identifiers are case-insensitive). Extra RowWriter columns
+    * (e.g. option placeholders not used by the CQL template) are read for
+    * positional alignment with tuple-based RDDs but skipped during binding. */
+  private val inStatement: Array[Boolean] = columnNames.map { name =>
+    preparedStmt.getVariableDefinitions.contains(name)
+  }.toArray
+
+  private val columnTypes = columnNames.indices.map { i =>
+    if (inStatement(i))
+      preparedStmt.getVariableDefinitions.get(columnNames(i)).getType
+    else null
+  }.toArray
+
+  /** Precomputed variable indices for each column in the prepared statement.
+    * -1 for columns not present in the statement (option placeholders). */
+  private val varIndices = columnNames.indices.map { i =>
+    if (inStatement(i))
+      preparedStmt.getVariableDefinitions.firstIndexOf(columnNames(i))
+    else -1
+  }.toArray
+  private val converters = columnTypes.map(dt =>
+    if (dt != null) ColumnType.converterToCassandra(dt) else null
+  )
   private val buffer = Array.ofDim[Any](columnNames.size)
   private val cachedCodecs = new Array[TypeCodec[AnyRef]](columnNames.size)
 
   /** Whether the prepared statement contains an auto-timestamp placeholder that
     * needs to be bound with a unique, incrementing microsecond timestamp per row. */
-  private val hasAutoTimestamp: Boolean = {
-    val varDefs = preparedStmt.getVariableDefinitions
-    (0 until varDefs.size()).exists(i => varDefs.get(i).getName.asInternal() == TableWriter.AutoTimestampParam)
-  }
+  private val hasAutoTimestamp: Boolean = preparedStmt.getVariableDefinitions.contains(TableWriter.AutoTimestampParam)
 
   /** Monotonically incrementing microsecond counter for auto-timestamps.
     * Uses a global counter to guarantee uniqueness across all concurrent
@@ -132,7 +153,7 @@ private[connector] class BoundStatementBuilder[T](
     rowWriter.readColumnValues(row, buffer)
     val codecRegistry = boundStatement.stmt.codecRegistry()
     var bytesCount = 0
-    for (i <- columnNames.indices) {
+    for (i <- columnNames.indices if inStatement(i)) {
       val converter = converters(i)
       val columnName = columnNames(i)
       val columnType = columnTypes(i)
@@ -146,12 +167,13 @@ private[connector] class BoundStatementBuilder[T](
         c
       }
       bindColumn(boundStatement, columnName, columnValue, codec)
-      val serializedValue = boundStatement.stmt.getBytesUnsafe(i)
+      val serializedValue = boundStatement.stmt.getBytesUnsafe(varIndices(i))
       if (serializedValue != null) bytesCount += serializedValue.remaining()
     }
 
     if (hasAutoTimestamp) {
       boundStatement.update(_.setLong(TableWriter.AutoTimestampParam, autoTsCounter.getAndIncrement()))
+      bytesCount += 8 // Long = 8 bytes, not counted in the column loop above
     }
 
     boundStatement.bytesCount = bytesCount
@@ -165,9 +187,24 @@ private[connector] object BoundStatementBuilder {
     * BoundStatementBuilder instances in the JVM. Ensures that every bound
     * statement gets a unique timestamp even when multiple Spark tasks bind
     * concurrently. Initialized to the current wall-clock time in microseconds
-    * so that timestamps stay in the same ballpark as server-assigned ones. */
-  private[writer] val globalAutoTsCounter =
-    new java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis() * 1000)
+    * so that timestamps stay in the same ballpark as server-assigned ones.
+    *
+    * Known limitations:
+    * - JVM restart (OOM, preemption, speculative execution) may initialize
+    *   a new counter below the previous JVM's last used value. This is
+    *   acceptable because the auto-timestamp only needs to order mutations
+    *   within a single batch to avoid list-mutation deduplication (issue #26);
+    *   cross-JVM ordering relies on CQL last-write-wins semantics.
+    * - Overflow is not a practical concern: at ~1.7e15 microseconds since
+    *   epoch, Long.MaxValue (~9.2e18) provides ~584 years of headroom. */
+  private val globalAutoTsCounter = {
+    val base = System.currentTimeMillis() * 1000
+    // Spread starting points across executors by adding a random offset in the range
+    // 0..999_999 microseconds (~1 second) to avoid collisions when JVMs start at
+    // similar times. With 1M possible offsets the birthday-paradox collision
+    // probability is negligible even for large executor counts.
+    new java.util.concurrent.atomic.AtomicLong(base + java.util.concurrent.ThreadLocalRandom.current().nextLong(1000000))
+  }
 
   /** Calculate bound statement size in bytes. */
   def calculateDataSize(stmt: BoundStatement): Int = {

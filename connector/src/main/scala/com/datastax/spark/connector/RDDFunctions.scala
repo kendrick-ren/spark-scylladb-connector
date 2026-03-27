@@ -131,14 +131,8 @@ class RDDFunctions[T](rdd: RDD[T]) extends WritableToCassandra[T] with Serializa
   implicit
     connector: CassandraConnector = CassandraConnector(sparkContext),
     rwf: RowWriterFactory[T]): Unit = {
-    // column delete require full primary key, partition key is enough otherwise
-    val columnDelete = deleteColumns match {
-      case c :SomeColumns => c.columns.nonEmpty
-      case _  => false
-    }
-
-    val writer = TableWriter(connector, keyspaceName, tableName, keyColumns, writeConf, !columnDelete)
-    rdd.sparkContext.runJob(rdd, writer.delete(deleteColumns) _)
+    val writer = TableWriter.forDelete(connector, keyspaceName, tableName, deleteColumns, keyColumns, writeConf)
+    rdd.sparkContext.runJob(rdd, writer.delete _)
   }
 
   /** Applies a function to each item, and groups consecutive items having the same value together.

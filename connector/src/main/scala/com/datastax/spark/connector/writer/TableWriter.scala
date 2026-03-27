@@ -46,7 +46,10 @@ class TableWriter[T] private (
     rowWriter: RowWriter[T],
     writeConf: WriteConf,
     partitions: Array[Partition],
-    tokenRangeAcc: Option[TokenRangeAccumulator]) extends Serializable with Logging {
+    tokenRangeAcc: Option[TokenRangeAccumulator],
+    private val isDelete: Boolean = false,
+    private var cachedDeleteQueryTemplate: Option[String] = None,
+    syntheticColumnNames: Set[String] = Set.empty) extends Serializable with Logging {
 
   require(!tableDef.isView,
     s"${tableDef.name} is a Materialized View and Views are not writable")
@@ -56,6 +59,12 @@ class TableWriter[T] private (
   val columnNames = rowWriter.columnNames diff writeConf.optionPlaceholders
   val columns = columnNames.map(tableDef.columnByName)
 
+  private lazy val tableDefWithoutPlaceholders: TableDef =
+    if (syntheticColumnNames.isEmpty) tableDef
+    else tableDef.copy(
+      regularColumns = tableDef.regularColumns.filterNot(c => syntheticColumnNames.contains(c.columnName))
+    )
+
   private[connector] lazy val queryTemplateUsingInsert: String = {
     val quotedColumnNames: Seq[String] = columnNames.map(quote)
     val columnSpec = quotedColumnNames.mkString(", ")
@@ -63,40 +72,78 @@ class TableWriter[T] private (
 
     val ifNotExistsSpec = if (writeConf.ifNotExists) "IF NOT EXISTS " else ""
 
-    val ttlSpec = writeConf.ttl match {
-      case TTLOption(PerRowWriteOptionValue(placeholder)) => Some(s"""TTL :$placeholder""")
-      case TTLOption(StaticWriteOptionValue(value)) => Some(s"TTL $value")
-      case _ => None
-    }
-
-    val timestampSpec = writeConf.timestamp match {
-      case TimestampOption(PerRowWriteOptionValue(placeholder)) => Some(s"""TIMESTAMP :$placeholder""")
-      case TimestampOption(StaticWriteOptionValue(value)) => Some(s"TIMESTAMP $value")
-      case _ => None
-    }
-
     val options = List(ttlSpec, timestampSpec).flatten
     val optionsSpec = if (options.nonEmpty) s"USING ${options.mkString(" AND ")}" else ""
 
     s"INSERT INTO ${quote(keyspaceName)}.${quote(tableName)} ($columnSpec) VALUES ($valueSpec) $ifNotExistsSpec$optionsSpec".trim
   }
 
-  private def deleteQueryTemplate(deleteColumns: ColumnSelector): String = {
-    val deleteColumnNames: Seq[String] = deleteColumns.selectFrom(tableDef).map(_.columnName)
+  // A `def` because `deleteColumns` is a parameter, not a property of the writer.
+  // Called once by `TableWriter.forDelete` which caches the result in `cachedDeleteQueryTemplate`.
+  // Precondition: `columns` (the key columns for the WHERE clause) must contain only primary key
+  // columns. This is enforced by the caller (RDDFunctions.deleteFromCassandra passes PK-only
+  // columns), and validated by the primary-key-only check below.
+  private[writer] def deleteQueryTemplate(deleteColumns: ColumnSelector): String = {
+    // CQL DELETE does not support collection-element operations (append, prepend, remove).
+    // Reject any CollectionColumnName before building the query.
+    deleteColumns match {
+      case sc: SomeColumns =>
+        val collectionRefs = sc.columns.collect { case c: CollectionColumnName => c.columnName }
+        if (collectionRefs.nonEmpty) {
+          throw new IllegalArgumentException(
+            s"CQL DELETE does not support collection behaviors. Collection columns found in delete columns: ${collectionRefs.mkString(", ")}")
+        }
+      case _ => // AllColumns, PrimaryKeyColumns, etc. never produce CollectionColumnName
+    }
+
+    // Validate column existence before selectFrom to give a DELETE-specific error message.
+    // selectFrom throws a generic NoSuchElementException that doesn't mention DELETE.
+    deleteColumns match {
+      case sc: SomeColumns =>
+        val tableColumnNames = tableDefWithoutPlaceholders.columns.map(_.columnName).toSet
+        val missing = sc.columns.map(_.columnName).filterNot(tableColumnNames.contains)
+        if (missing.nonEmpty)
+          throw new IllegalArgumentException(
+            s"Column(s) not found for DELETE in table ${tableDef.tableName}: ${missing.mkString(", ")}")
+      case _ =>
+    }
+
+    val primaryKeyNames = tableDef.primaryKey.map(_.columnName).toSet
+    // selectFrom uses tableDefWithoutPlaceholders so that synthetic option-placeholder columns are excluded
+    val allDeleteColumnNames: Seq[String] = deleteColumns.selectFrom(tableDefWithoutPlaceholders).map(_.columnName)
+    // When AllColumns is used, auto-filter primary key columns since they can't be deleted
+    val deleteColumnNames = if (deleteColumns == AllColumns) {
+      val filtered = allDeleteColumnNames.filterNot(primaryKeyNames.contains)
+      if (filtered.isEmpty)
+        logInfo(s"Table ${tableDef.tableName} has no non-PK columns; AllColumns delete will perform a full-row delete")
+      filtered
+    } else {
+      allDeleteColumnNames
+    }
     val (primaryKey, regularColumns) = columns.partition(_.isPrimaryKeyColumn)
     if (regularColumns.nonEmpty) {
       throw new IllegalArgumentException(
-        s"Only primary key columns can be used in delete. Regular columns found: ${regularColumns.mkString(", ")}")
+        s"Only primary key columns can be specified as key columns for DELETE. Regular columns found: ${regularColumns.mkString(", ")}")
     }
-    TableWriter.checkMissingColumns(tableDef, deleteColumnNames)
-
+    // Empty deleteColumnNames = full row delete; PK column check only applies to column-level deletes
+    if (deleteColumnNames.nonEmpty) {
+      val pkInDelete = deleteColumnNames.filter(primaryKeyNames.contains)
+      if (pkInDelete.nonEmpty) {
+        throw new IllegalArgumentException(
+          s"Primary key columns cannot be specified as delete columns. Primary key columns found: ${pkInDelete.mkString(", ")}")
+      }
+    }
     def quotedColumnNames(columns: Seq[ColumnDef]) = columns.map(_.columnName).map(quote)
     val deleteColumnsClause = deleteColumnNames.map(quote).mkString(", ")
     val whereClause = quotedColumnNames(primaryKey).map(c => s"$c = :$c").mkString(" AND ")
 
-    s"DELETE ${deleteColumnsClause} FROM ${quote(keyspaceName)}.${quote(tableName)} WHERE $whereClause"
+    val usingTimestampClause = timestampSpec.map(ts => s" USING $ts").getOrElse("")
+    val deleteSpec = if (deleteColumnsClause.nonEmpty) s"$deleteColumnsClause " else ""
+
+    s"DELETE ${deleteSpec}FROM ${quote(keyspaceName)}.${quote(tableName)}$usingTimestampClause WHERE $whereClause"
   }
-  private lazy val queryTemplateUsingUpdate: String = {
+
+  private[writer] lazy val queryTemplateUsingUpdate: String = {
     val (primaryKey, regularColumns) = columns.partition(_.isPrimaryKeyColumn)
     val (counterColumns, nonCounterColumns) = regularColumns.partition(_.isCounterColumn)
 
@@ -121,22 +168,38 @@ class TableWriter[T] private (
     val setClause = (setNonCounterColumnsClause ++ setCounterColumnsClause).mkString(", ")
     val whereClause = quotedColumnNames(primaryKey).map(c => s"$c = :$c").mkString(" AND ")
 
-    // Counter updates don't support USING TIMESTAMP.
+    // Counter updates don't support USING TIMESTAMP or USING TTL.
     // For all other UPDATEs, assign per-statement timestamps to ensure that multiple
     // mutations to the same list within a batch get distinct timestamps. Without this,
     // Scylla drops all but one list mutation when they share the same timestamp.
     // See: https://github.com/scylladb/spark-scylladb-connector/issues/26
+    // Note: TTL is now also applied to UPDATE statements when writeConf.ttl is set.
+    // Previously TTL was only included in INSERT statements.
     val usingClause = if (isCounterUpdate) {
       ""
     } else {
-      writeConf.timestamp match {
-        case TimestampOption(PerRowWriteOptionValue(placeholder)) => s" USING TIMESTAMP :$placeholder"
-        case TimestampOption(StaticWriteOptionValue(value)) => s" USING TIMESTAMP $value"
-        case _ => s" USING TIMESTAMP :${TableWriter.AutoTimestampParam}"
-      }
+      val autoTs = Some(s"TIMESTAMP :${TableWriter.AutoTimestampParam}")
+      val parts = List(ttlSpec, timestampSpec.orElse(autoTs)).flatten
+      if (parts.nonEmpty) s" USING ${parts.mkString(" AND ")}" else ""
     }
 
     s"UPDATE ${quote(keyspaceName)}.${quote(tableName)}${usingClause} SET $setClause WHERE $whereClause"
+  }
+
+  private lazy val timestampSpec: Option[String] = {
+    writeConf.timestamp match {
+      case TimestampOption(PerRowWriteOptionValue(placeholder)) => Some(s"TIMESTAMP :$placeholder")
+      case TimestampOption(StaticWriteOptionValue(value)) => Some(s"TIMESTAMP $value")
+      case _ => None
+    }
+  }
+
+  private lazy val ttlSpec: Option[String] = {
+    writeConf.ttl match {
+      case TTLOption(PerRowWriteOptionValue(placeholder)) => Some(s"TTL :$placeholder")
+      case TTLOption(StaticWriteOptionValue(value)) => Some(s"TTL $value")
+      case _ => None
+    }
   }
 
   private val isCounterUpdate =
@@ -145,9 +208,12 @@ class TableWriter[T] private (
   private val containsCollectionBehaviors =
     columnSelector.exists(_.isInstanceOf[CollectionColumnName])
 
-  private[connector] val isIdempotent: Boolean = {
+  private[connector] lazy val isIdempotent: Boolean = {
+    // DELETEs are inherently idempotent
+    if (isDelete) {
+      true
     //All counter operations are not Idempotent
-    if (columns.exists(_.isCounterColumn)) {
+    } else if (columns.exists(_.isCounterColumn)) {
        false
     } else {
       columnSelector.forall {
@@ -202,18 +268,21 @@ class TableWriter[T] private (
     * INSERT otherwise
     */
   def write(taskContext: TaskContext, data: Iterator[T]): Unit = {
+    require(!isDelete, "write() must not be called on a delete-configured TableWriter; use delete() instead")
     val asyncStatementWriter = getAsyncWriter()
     writeInternal(asyncStatementWriter, taskContext, data)
   }
 
   /**
-    * Cql DELETE statement
-    * @param columns columns to delete, the row will be deleted completely if the list is empty
-    * @param taskContext
-    * @param data primary key values to select delete rows
+    * Cql DELETE statement. The writer must be created via [[TableWriter.forDelete]] which
+    * eagerly validates and caches the delete query template.
     */
-  def delete(columns: ColumnSelector) (taskContext: TaskContext, data: Iterator[T]): Unit =
-    writeInternal(getAsyncWriterInternal(deleteQueryTemplate(columns)), taskContext, data)
+  def delete(taskContext: TaskContext, data: Iterator[T]): Unit = {
+    val template = cachedDeleteQueryTemplate.getOrElse(
+      throw new IllegalStateException(
+        "delete() requires a cached delete query template; create the writer with TableWriter.forDelete()"))
+    writeInternal(getAsyncWriterInternal(template), taskContext, data)
+  }
 
   def extractTokenRange(partitionId: Int): Iterable[CqlTokenRange[_, _]] =
     partitions.lift(partitionId) match {
@@ -222,6 +291,7 @@ class TableWriter[T] private (
     }
 
   def getAsyncWriter(): AsyncStatementWriter[T] = {
+    require(!isDelete, "getAsyncWriter() must not be called on a delete-configured TableWriter; use delete() instead")
     if (isCounterUpdate || containsCollectionBehaviors) {
       getAsyncWriterInternal(queryTemplateUsingUpdate)
     }
@@ -234,7 +304,7 @@ class TableWriter[T] private (
     connector.withSessionDo { session =>
       val protocolVersion = session.getContext.getProtocolVersion
       val stmt = prepareStatement(queryTemplate, session)
-      val batchType = if (isCounterUpdate) DefaultBatchType.COUNTER else DefaultBatchType.UNLOGGED
+      val batchType = if (!isDelete && isCounterUpdate) DefaultBatchType.COUNTER else DefaultBatchType.UNLOGGED
 
       val boundStmtBuilder = new BoundStatementBuilder(
         rowWriter,
@@ -340,7 +410,19 @@ case class AsyncStatementWriter[T](
 object TableWriter {
 
   /** Name of the auto-generated timestamp bind parameter added to UPDATE statements. */
-  private[writer] val AutoTimestampParam = "autots"
+  private[writer] val AutoTimestampParam = "connector_autots"
+
+  private def checkOptionPlaceholderCollisions(table: TableDef, writeConf: WriteConf): Unit = {
+    val allColumnNames = (table.partitionKey ++ table.clusteringColumns ++ table.regularColumns)
+      .map(_.columnName).toSet
+    if (allColumnNames.contains(AutoTimestampParam))
+      throw new IllegalArgumentException(
+        s"Table column '$AutoTimestampParam' conflicts with internal auto-timestamp parameter. " +
+        "Rename the column or use an explicit timestamp via WriteConf.")
+    if (writeConf.optionPlaceholders.contains(AutoTimestampParam))
+      throw new IllegalArgumentException(
+        s"Per-row placeholder name '$AutoTimestampParam' conflicts with internal auto-timestamp parameter.")
+  }
 
   private def checkMissingColumns(table: TableDef, columnNames: Seq[String]): Unit = {
     val allColumnNames = table.columns.map(_.columnName)
@@ -434,10 +516,10 @@ object TableWriter {
       )
   }
 
-  private def checkColumns(table: TableDef, columnRefs: IndexedSeq[ColumnRef], checkPartitionKey: Boolean) = {
+  private def checkColumns(table: TableDef, columnRefs: IndexedSeq[ColumnRef], partitionKeyOnly: Boolean) = {
     val columnNames = columnRefs.map(_.columnName)
     checkMissingColumns(table, columnNames)
-    if (checkPartitionKey) {
+    if (partitionKeyOnly) {
       // For Deletes we only need a partition Key for a valid delete statement
       checkMissingPartitionKeyColumns(table, columnNames)
     }
@@ -452,7 +534,48 @@ object TableWriter {
     checkCollectionBehaviors(table, columnRefs)
   }
 
-  /** Columns that cannot actually be written to because they representt virtual endpoints
+  /** Creates a [[TableWriter]] configured for DELETE operations.
+    * Determines whether this is a column-level or full-row delete, adjusts the
+    * [[WriteConf]] (stripping TTL and other INSERT-only options), and constructs
+    * the writer with the appropriate key-column validation mode.
+    * Eagerly validates the delete query template on the driver to fail fast
+    * rather than wasting cluster resources on executor-side validation. */
+  private[connector] def forDelete[T : RowWriterFactory](
+      connector: CassandraConnector,
+      keyspaceName: String,
+      tableName: String,
+      deleteColumns: ColumnSelector,
+      keyColumns: ColumnSelector,
+      writeConf: WriteConf): TableWriter[T] = {
+    keyColumns match {
+      case AllColumns => throw new IllegalArgumentException(
+        "AllColumns cannot be used as keyColumns for DELETE; use PrimaryKeyColumns or SomeColumns(...)")
+      case _ =>
+    }
+    deleteColumns match {
+      case PrimaryKeyColumns | PartitionKeyColumns =>
+        throw new IllegalArgumentException(
+          s"$deleteColumns cannot be used as deleteColumns for DELETE; " +
+          "use SomeColumns(...) to delete specific columns or SomeColumns() for full-row delete")
+      case _ =>
+    }
+    // column delete requires full primary key, partition key is enough otherwise
+    val columnDelete = deleteColumns match {
+      case c: SomeColumns => c.columns.nonEmpty
+      case AllColumns     => true
+      case _              => false
+    }
+    val deleteConf = writeConf.forDelete
+    val writer = TableWriter[T](connector, keyspaceName, tableName, keyColumns, deleteConf,
+      partitionKeyOnly = !columnDelete, isDelete = true)
+    // Eagerly compute and cache the delete query template on the driver side.
+    // This triggers all validation (column existence, PK checks, collection checks)
+    // before the Spark job is submitted, avoiding wasted cluster resources.
+    writer.cachedDeleteQueryTemplate = Some(writer.deleteQueryTemplate(deleteColumns))
+    writer
+  }
+
+  /** Columns that cannot actually be written to because they represent virtual endpoints
     */
   private val InternalColumns = Set("solr_query")
 
@@ -462,12 +585,13 @@ object TableWriter {
       tableName: String,
       columnNames: ColumnSelector,
       writeConf: WriteConf,
-      checkPartitionKey: Boolean = false,
+      partitionKeyOnly: Boolean = false,
       partitions: Array[Partition] = Array(),
-      tokenRangeAcc: Option[TokenRangeAccumulator] = None): TableWriter[T] = {
+      tokenRangeAcc: Option[TokenRangeAccumulator] = None,
+      isDelete: Boolean = false): TableWriter[T] = {
 
     val tableDef = tableFromCassandra(connector, keyspaceName, tableName)
-    TableWriter(connector, tableDef, columnNames, writeConf, checkPartitionKey, partitions, tokenRangeAcc)
+    TableWriter(connector, tableDef, columnNames, writeConf, partitionKeyOnly, partitions, tokenRangeAcc, isDelete)
   }
 
   def apply[T : RowWriterFactory](
@@ -475,19 +599,31 @@ object TableWriter {
        tableDef: TableDef,
        columnNames: ColumnSelector,
        writeConf: WriteConf,
-       checkPartitionKey: Boolean,
+       partitionKeyOnly: Boolean,
        partitions: Array[Partition],
-       tokenRangeAcc: Option[TokenRangeAccumulator]): TableWriter[T] = {
+       tokenRangeAcc: Option[TokenRangeAccumulator],
+       isDelete: Boolean): TableWriter[T] = {
 
-    val optionColumns = writeConf.optionsAsColumns(tableDef.keyspaceName, tableDef.tableName)
-    val tablDefWithMeta = tableDef.copy(regularColumns = tableDef.regularColumns ++ optionColumns)
+    val optionColumns = writeConf.optionsAsColumns
+    val existingColumnNames = tableDef.columns.map(_.columnName).toSet
+    val newOptionColumns = optionColumns.filterNot(c => existingColumnNames.contains(c.columnName))
+    val tablDefWithMeta = tableDef.copy(regularColumns = tableDef.regularColumns ++ newOptionColumns)
 
-    val selectedColumns = columnNames
+    checkOptionPlaceholderCollisions(tableDef, writeConf)
+
+    val baseSelectedColumns = columnNames
       .selectFrom(tablDefWithMeta)
       .filter(col => !InternalColumns.contains(col.columnName))
+    // Ensure per-row option placeholder columns (e.g. per-row timestamp/TTL) are included
+    // even when columnNames is PrimaryKeyColumns or AllColumns, which would not select them.
+    val selectedColumnNames = baseSelectedColumns.map(_.columnName).toSet
+    val missingOptionColumns = optionColumns.filterNot(c => selectedColumnNames.contains(c.columnName))
+    val selectedColumns = baseSelectedColumns ++ missingOptionColumns.map(c => ColumnName(c.columnName))
+
     val rowWriter = implicitly[RowWriterFactory[T]].rowWriter(tablDefWithMeta, selectedColumns)
 
-    checkColumns(tablDefWithMeta, selectedColumns, checkPartitionKey)
-    new TableWriter[T](connector, tablDefWithMeta, selectedColumns, rowWriter, writeConf, partitions, tokenRangeAcc)
+    checkColumns(tablDefWithMeta, selectedColumns, partitionKeyOnly)
+    new TableWriter[T](connector, tablDefWithMeta, selectedColumns, rowWriter, writeConf, partitions, tokenRangeAcc, isDelete,
+      syntheticColumnNames = newOptionColumns.map(_.columnName).toSet)
   }
 }
